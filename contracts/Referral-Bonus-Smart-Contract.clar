@@ -16,6 +16,12 @@
 (define-data-var contract-balance uint u0)
 (define-data-var total-bonuses-paid uint u0)
 (define-data-var referral-bonus-amount uint u1000000)
+(define-data-var milestone-tier-1-threshold uint u3)
+(define-data-var milestone-tier-2-threshold uint u10)
+(define-data-var milestone-tier-3-threshold uint u25)
+(define-data-var milestone-tier-1-multiplier uint u150)
+(define-data-var milestone-tier-2-multiplier uint u200)
+(define-data-var milestone-tier-3-multiplier uint u300)
 
 (define-map referrals
     { referral-id: uint }
@@ -58,6 +64,8 @@
         total-referrals: uint,
         successful-hires: uint,
         total-bonuses-earned: uint,
+        milestone-tier: uint,
+        milestone-achieved-at: uint,
     }
 )
 
@@ -94,11 +102,15 @@
                 total-referrals: (+ (get total-referrals existing-stats) u1),
                 successful-hires: (get successful-hires existing-stats),
                 total-bonuses-earned: (get total-bonuses-earned existing-stats),
+                milestone-tier: (get milestone-tier existing-stats),
+                milestone-achieved-at: (get milestone-achieved-at existing-stats),
             })
             (map-set referrer-stats { referrer: tx-sender } {
                 total-referrals: u1,
                 successful-hires: u0,
                 total-bonuses-earned: u0,
+                milestone-tier: u0,
+                milestone-achieved-at: u0,
             })
         )
         (var-set next-referral-id (+ referral-id u1))
@@ -144,14 +156,35 @@
                     total-referrals: u0,
                     successful-hires: u0,
                     total-bonuses-earned: u0,
+                    milestone-tier: u0,
+                    milestone-achieved-at: u0,
                 }
                     (map-get? referrer-stats { referrer: referrer })
                 ))
+                (new-hire-count (+ (get successful-hires existing-stats) u1))
+                (new-tier (if (>= new-hire-count (var-get milestone-tier-3-threshold))
+                    u3
+                    (if (>= new-hire-count (var-get milestone-tier-2-threshold))
+                        u2
+                        (if (>= new-hire-count
+                                (var-get milestone-tier-1-threshold)
+                            )
+                            u1
+                            u0
+                        )
+                    )
+                ))
+                (milestone-block (unwrap-panic (get-stacks-block-info? time burn-block-height)))
             )
             (map-set referrer-stats { referrer: referrer } {
                 total-referrals: (get total-referrals existing-stats),
-                successful-hires: (+ (get successful-hires existing-stats) u1),
+                successful-hires: new-hire-count,
                 total-bonuses-earned: (get total-bonuses-earned existing-stats),
+                milestone-tier: new-tier,
+                milestone-achieved-at: (if (> new-tier (get milestone-tier existing-stats))
+                    milestone-block
+                    (get milestone-achieved-at existing-stats)
+                ),
             })
         )
         (var-set next-hire-id (+ hire-id u1))
@@ -165,8 +198,18 @@
             (referral (unwrap! (map-get? referrals { referral-id: (get referral-id hire) })
                 err-referral-not-found
             ))
-            (bonus-amount (get bonus-amount referral))
             (referrer (get referrer referral))
+            (current-referrer-stats (default-to {
+                total-referrals: u0,
+                successful-hires: u0,
+                total-bonuses-earned: u0,
+                milestone-tier: u0,
+                milestone-achieved-at: u0,
+            }
+                (map-get? referrer-stats { referrer: referrer })
+            ))
+            (bonus-multiplier (get-milestone-multiplier (get milestone-tier current-referrer-stats)))
+            (bonus-amount (/ (* (get bonus-amount referral) bonus-multiplier) u100))
         )
         (asserts! (is-eq tx-sender contract-owner) err-owner-only)
         (asserts! (get confirmed hire) err-hire-not-confirmed)
@@ -178,19 +221,13 @@
         (map-set hires { hire-id: hire-id } (merge hire { bonus-paid: true }))
         (var-set contract-balance (- (var-get contract-balance) bonus-amount))
         (var-set total-bonuses-paid (+ (var-get total-bonuses-paid) bonus-amount))
-        (let ((existing-stats (default-to {
-                total-referrals: u0,
-                successful-hires: u0,
-                total-bonuses-earned: u0,
-            }
-                (map-get? referrer-stats { referrer: referrer })
-            )))
-            (map-set referrer-stats { referrer: referrer } {
-                total-referrals: (get total-referrals existing-stats),
-                successful-hires: (get successful-hires existing-stats),
-                total-bonuses-earned: (+ (get total-bonuses-earned existing-stats) bonus-amount),
-            })
-        )
+        (map-set referrer-stats { referrer: referrer } {
+            total-referrals: (get total-referrals current-referrer-stats),
+            successful-hires: (get successful-hires current-referrer-stats),
+            total-bonuses-earned: (+ (get total-bonuses-earned current-referrer-stats) bonus-amount),
+            milestone-tier: (get milestone-tier current-referrer-stats),
+            milestone-achieved-at: (get milestone-achieved-at current-referrer-stats),
+        })
         (ok bonus-amount)
     )
 )
@@ -257,6 +294,8 @@
         total-referrals: u0,
         successful-hires: u0,
         total-bonuses-earned: u0,
+        milestone-tier: u0,
+        milestone-achieved-at: u0,
     }
         (map-get? referrer-stats { referrer: referrer })
     )
@@ -284,6 +323,97 @@
 
 (define-read-only (get-next-hire-id)
     (var-get next-hire-id)
+)
+
+(define-private (get-milestone-multiplier (tier uint))
+    (if (is-eq tier u3)
+        (var-get milestone-tier-3-multiplier)
+        (if (is-eq tier u2)
+            (var-get milestone-tier-2-multiplier)
+            (if (is-eq tier u1)
+                (var-get milestone-tier-1-multiplier)
+                u100
+            )
+        )
+    )
+)
+
+(define-public (update-milestone-thresholds
+        (tier-1-threshold uint)
+        (tier-2-threshold uint)
+        (tier-3-threshold uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts!
+            (and
+                (> tier-1-threshold u0)
+                (> tier-2-threshold tier-1-threshold)
+                (> tier-3-threshold tier-2-threshold)
+            )
+            err-invalid-amount
+        )
+        (var-set milestone-tier-1-threshold tier-1-threshold)
+        (var-set milestone-tier-2-threshold tier-2-threshold)
+        (var-set milestone-tier-3-threshold tier-3-threshold)
+        (ok true)
+    )
+)
+
+(define-public (update-milestone-multipliers
+        (tier-1-multiplier uint)
+        (tier-2-multiplier uint)
+        (tier-3-multiplier uint)
+    )
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (asserts!
+            (and
+                (> tier-1-multiplier u100)
+                (> tier-2-multiplier tier-1-multiplier)
+                (> tier-3-multiplier tier-2-multiplier)
+            )
+            err-invalid-amount
+        )
+        (var-set milestone-tier-1-multiplier tier-1-multiplier)
+        (var-set milestone-tier-2-multiplier tier-2-multiplier)
+        (var-set milestone-tier-3-multiplier tier-3-multiplier)
+        (ok true)
+    )
+)
+
+(define-read-only (get-milestone-info (referrer principal))
+    (let ((stats (get-referrer-stats referrer)))
+        {
+            current-tier: (get milestone-tier stats),
+            next-tier-hires-needed: (-
+                (if (is-eq (get milestone-tier stats) u0)
+                    (var-get milestone-tier-1-threshold)
+                    (if (is-eq (get milestone-tier stats) u1)
+                        (var-get milestone-tier-2-threshold)
+                        (if (is-eq (get milestone-tier stats) u2)
+                            (var-get milestone-tier-3-threshold)
+                            u0
+                        )
+                    )
+                )
+                (get successful-hires stats)
+            ),
+            current-multiplier: (get-milestone-multiplier (get milestone-tier stats)),
+            milestone-achieved-at: (get milestone-achieved-at stats),
+        }
+    )
+)
+
+(define-read-only (get-milestone-config)
+    {
+        tier-1-threshold: (var-get milestone-tier-1-threshold),
+        tier-2-threshold: (var-get milestone-tier-2-threshold),
+        tier-3-threshold: (var-get milestone-tier-3-threshold),
+        tier-1-multiplier: (var-get milestone-tier-1-multiplier),
+        tier-2-multiplier: (var-get milestone-tier-2-multiplier),
+        tier-3-multiplier: (var-get milestone-tier-3-multiplier),
+    }
 )
 
 (define-read-only (get-contract-stats)
