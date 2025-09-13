@@ -10,6 +10,8 @@
 (define-constant err-hire-already-confirmed (err u108))
 (define-constant err-hire-not-confirmed (err u109))
 (define-constant err-bonus-already-paid (err u110))
+(define-constant err-no-escrow-available (err u111))
+(define-constant err-escrow-already-exists (err u112))
 
 (define-data-var next-referral-id uint u1)
 (define-data-var next-hire-id uint u1)
@@ -22,6 +24,7 @@
 (define-data-var milestone-tier-1-multiplier uint u150)
 (define-data-var milestone-tier-2-multiplier uint u200)
 (define-data-var milestone-tier-3-multiplier uint u300)
+(define-data-var total-escrowed-amount uint u0)
 
 (define-map referrals
     { referral-id: uint }
@@ -66,6 +69,16 @@
         total-bonuses-earned: uint,
         milestone-tier: uint,
         milestone-achieved-at: uint,
+    }
+)
+
+(define-map bonus-escrow
+    { hire-id: uint }
+    {
+        referrer: principal,
+        amount: uint,
+        escrowed-at: uint,
+        claimed: bool,
     }
 )
 
@@ -175,6 +188,11 @@
                     )
                 ))
                 (milestone-block (unwrap-panic (get-stacks-block-info? time burn-block-height)))
+                (bonus-multiplier (get-milestone-multiplier new-tier))
+                (escrow-amount (/ (* (get bonus-amount referral) bonus-multiplier) u100))
+            )
+            (asserts! (>= (var-get contract-balance) escrow-amount)
+                err-insufficient-balance
             )
             (map-set referrer-stats { referrer: referrer } {
                 total-referrals: (get total-referrals existing-stats),
@@ -186,9 +204,66 @@
                     (get milestone-achieved-at existing-stats)
                 ),
             })
+            (map-set bonus-escrow { hire-id: hire-id } {
+                referrer: referrer,
+                amount: escrow-amount,
+                escrowed-at: milestone-block,
+                claimed: false,
+            })
+            (var-set contract-balance
+                (- (var-get contract-balance) escrow-amount)
+            )
+            (var-set total-escrowed-amount
+                (+ (var-get total-escrowed-amount) escrow-amount)
+            )
         )
         (var-set next-hire-id (+ hire-id u1))
         (ok hire-id)
+    )
+)
+
+(define-public (claim-bonus (hire-id uint))
+    (let (
+            (escrow (unwrap! (map-get? bonus-escrow { hire-id: hire-id })
+                err-no-escrow-available
+            ))
+            (hire (unwrap! (map-get? hires { hire-id: hire-id }) err-not-found))
+        )
+        (asserts! (is-eq tx-sender (get referrer escrow)) err-unauthorized)
+        (asserts! (not (get claimed escrow)) err-bonus-already-paid)
+        (asserts! (get confirmed hire) err-hire-not-confirmed)
+        (try! (as-contract (stx-transfer? (get amount escrow) tx-sender (get referrer escrow))))
+        (map-set bonus-escrow { hire-id: hire-id }
+            (merge escrow { claimed: true })
+        )
+        (map-set hires { hire-id: hire-id } (merge hire { bonus-paid: true }))
+        (var-set total-escrowed-amount
+            (- (var-get total-escrowed-amount) (get amount escrow))
+        )
+        (var-set total-bonuses-paid
+            (+ (var-get total-bonuses-paid) (get amount escrow))
+        )
+        (let (
+                (referrer (get referrer escrow))
+                (current-stats (default-to {
+                    total-referrals: u0,
+                    successful-hires: u0,
+                    total-bonuses-earned: u0,
+                    milestone-tier: u0,
+                    milestone-achieved-at: u0,
+                }
+                    (map-get? referrer-stats { referrer: referrer })
+                ))
+            )
+            (map-set referrer-stats { referrer: referrer } {
+                total-referrals: (get total-referrals current-stats),
+                successful-hires: (get successful-hires current-stats),
+                total-bonuses-earned: (+ (get total-bonuses-earned current-stats) (get amount escrow)),
+                milestone-tier: (get milestone-tier current-stats),
+                milestone-achieved-at: (get milestone-achieved-at current-stats),
+            })
+        )
+        (ok (get amount escrow))
     )
 )
 
@@ -278,7 +353,12 @@
 )
 
 (define-read-only (get-hire (hire-id uint))
-    (map-get? hires { hire-id: hire-id })
+    (let ((hire-data (map-get? hires { hire-id: hire-id })))
+        (match hire-data
+            hire (some (merge hire { escrow-info: (map-get? bonus-escrow { hire-id: hire-id }) }))
+            none
+        )
+    )
 )
 
 (define-read-only (get-user-referrals (user principal))
@@ -416,12 +496,26 @@
     }
 )
 
+(define-read-only (get-bonus-escrow (hire-id uint))
+    (map-get? bonus-escrow { hire-id: hire-id })
+)
+
+(define-read-only (get-total-escrowed)
+    (var-get total-escrowed-amount)
+)
+
+(define-read-only (get-available-balance)
+    (var-get contract-balance)
+)
+
 (define-read-only (get-contract-stats)
     {
         total-referrals: (- (var-get next-referral-id) u1),
         total-hires: (- (var-get next-hire-id) u1),
         total-bonuses-paid: (var-get total-bonuses-paid),
         contract-balance: (var-get contract-balance),
+        total-escrowed: (var-get total-escrowed-amount),
+        available-balance: (var-get contract-balance),
         current-bonus-amount: (var-get referral-bonus-amount),
     }
 )
